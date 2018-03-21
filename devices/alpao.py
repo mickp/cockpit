@@ -86,7 +86,7 @@ class Alpao(device.Device):
                         break
                     if self.awaitimage:
                         if (self.slmdev is None):
-                            self.slmdev=depot.getDevice(devices.boulderSLM)
+                            self.slmdev=depot.getDeviceWithName(self.config.get('slmdevice'))
                             self.slmsize=self.slmdev.connection.get_shape()
                             print self.slmsize
                             print self.wavelength
