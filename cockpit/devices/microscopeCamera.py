@@ -63,6 +63,8 @@ class MicroscopeCamera(camera.CameraDevice):
         self.listener = cockpit.util.listener.Listener(self.proxy,
                                                lambda *args: self.receiveData(*args))
         self.cached_settings={}
+		# TODO: check if we still need to set the trasform here.
+        self.settings['transform'] = tuple(self.path_transform[i] ^ self.base_transform[i] for i in range(3))
         self.settings_editor = None
         self.defaults = DEFAULTS_NONE
         self.get_all_settings = self.proxy.get_all_settings
