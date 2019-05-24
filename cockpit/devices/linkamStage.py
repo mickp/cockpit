@@ -61,6 +61,7 @@ class RefillTimerPanel(wx.Panel):
     def __init__(self, *args, **kwargs):
         self._refillFunc = None
 
+        self.use_colours = kwargs.pop('use_colours', False)
         label_text = kwargs.pop('label', '')
         kwargs['style'] = kwargs.get('style', 0) | wx.BORDER_SIMPLE
         super().__init__(*args, **kwargs)
@@ -135,7 +136,7 @@ class RefillTimerPanel(wx.Panel):
                 fg = wx.Colour("white")
             else:
                 self.filling.SetLabel(" ")
-        if bg != self.GetBackgroundColour():
+        if self.use_colours and bg != self.GetBackgroundColour():
             self.SetBackgroundColour(bg)
             for c in self.GetChildren():
                 c.SetForegroundColour(fg)
@@ -317,6 +318,7 @@ class LinkamStage(MicroscopeBase, stage.StageDevice):
                 self.elements[r].setRefillFunc(self._proxy.refill_chamber)
             elif r == 'external':
                 self.elements[r].setRefillFunc(self._proxy.refill_dewar)
+                self.elements[r].use_colours = True
         panel.Fit()
         self.hasUI = True
         return panel
