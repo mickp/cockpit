@@ -29,6 +29,7 @@ import cockpit.util.phaseViewer as phaseViewer
 import cockpit.util.charAssayViewer as charAssayViewer
 import numpy as np
 import scipy.stats as stats
+from scipy.optimize import minimize
 
 
 # the AO device subclasses Device to provide compatibility with microscope.
@@ -556,7 +557,7 @@ class MicroscopeDeformableMirror(MicroscopeBase, device.Device):
     # available, then we just perform sensorless AO.
     def displaySensorlessAOMenu(self):
         self.showCameraMenu("Perform sensorless AO with %s camera",
-                            self.correctSensorlessSetup)
+                            self.correctSensorless)
 
     ## Generate a menu where the user can select a camera to use to perform
     # some action.
@@ -575,7 +576,31 @@ class MicroscopeDeformableMirror(MicroscopeBase, device.Device):
                                 id=i + 1)
             cockpit.gui.guiUtils.placeMenuAtMouse(self.panel, menu)
 
-    def correctSensorlessSetup(self, camera, nollZernike=np.array([11, 22, 5, 6, 7, 8, 9, 10])):
+    def setAOImage(self, image, timestamp):
+        self.current_sensoreless_image = image
+
+    def getAOImage(self):
+        return self.current_sensoreless_image
+
+    def measureImageQuality(self, current_zernike):
+        # Send actuator positions to the DM
+        applied_phase = np.zeros(self.no_actuators)
+        applied_phase[self.nollZernike] = current_zernike
+        self.zernike_applied.append(np.ndarray.tolist(applied_phase))
+        self.proxy.set_phase(applied_phase, offset=self.actuator_offset)
+
+        # Take image with current actutor values
+        self.takeImage()
+
+        # Calculate quality metric and return negative
+        ## We return the negative as the simplex optimisation is a minimisation problem so we need to look for a global
+        ## minima rather than a global maxima
+        image = self.getAOImage()
+        self.correction_stack.append(np.ndarray.tolist(image))
+        metric = self.proxy.measure_fourier_metric(image, pixel_size=self.pixelSize)
+        return -metric
+
+    def correctSensorless(self, camera, nollZernike=np.array([11, 22, 5, 6, 7, 8, 9, 10])):
         print("Performing sensorless AO setup")
         # Note: Default is to correct Primary and Secondary Spherical aberration and both
         # orientations of coma, astigmatism and trefoil
@@ -589,7 +614,7 @@ class MicroscopeDeformableMirror(MicroscopeBase, device.Device):
             except:
                 raise e
 
-        print("Setting Zernike modes")
+        print("Setting Zernike modes to correct")
         self.nollZernike = nollZernike
 
         self.actuator_offset = None
@@ -599,150 +624,94 @@ class MicroscopeDeformableMirror(MicroscopeBase, device.Device):
         print("Subscribing to camera events")
         # Subscribe to camera events
         self.camera = camera
-        events.subscribe("new image %s" % self.camera.name, self.correctSensorlessImage)
+        events.subscribe("new image %s" % self.camera.name, self.setAOImage)
 
         # Get pixel size
         self.objectives = cockpit.depot.getHandlersOfType(cockpit.depot.OBJECTIVE)[0]
         self.pixelSize = self.objectives.getPixelSize()
 
-        # Initialise the Zernike modes to apply
-        print("Initialising the Zernike modes to apply")
-        self.numMes = 9
-        num_it = 2
-        self.z_steps = np.linspace(-1.5, 1.5, self.numMes)
-
-        for ii in range(num_it):
-            it_zernike_applied = np.zeros((self.numMes * self.nollZernike.shape[0], self.no_actuators))
-            for noll_ind in self.nollZernike:
-                ind = np.where(self.nollZernike == noll_ind)[0][0]
-                it_zernike_applied[ind * self.numMes:(ind + 1) * self.numMes,
-                noll_ind - 1] = self.z_steps
-            if ii == 0:
-                self.zernike_applied = it_zernike_applied
-            else:
-                self.zernike_applied = np.concatenate((self.zernike_applied, it_zernike_applied))
-
-        # Initialise stack to store correction iumages
-        print("Initialising stack to store correction images")
+        # Initialise stack to store correction images
+        print("Initialising variables")
         self.correction_stack = []
+        z_init = (np.random.random(len(nollZernike))-0.5)*0.25
+        self.zernike_applied = []
+        self.zernike_applied.append(np.ndarray.tolist(z_init))
+        simplex_init = []
+        simplex_init.append(np.ndarray.tolist(z_init))
+        for ii in range(len(z_init)):
+            sim_vert = z_init.copy()
+            sim_vert[ii] += 0.05
+            simplex_init.append(np.ndarray.tolist(sim_vert))
+        simplex_init = np.asarray(simplex_init)
+        self.numMes = (len(nollZernike) * 2) + 1
 
-        print("Applying the first Zernike mode")
+        print("Optimising...")
         # Apply the first Zernike mode
-        print(self.zernike_applied[len(self.correction_stack), :])
-        self.proxy.set_phase(self.zernike_applied[len(self.correction_stack), :], offset=self.actuator_offset)
+        res = minimize(x0= z_init, fun=self.measureImageQuality, method='Nelder-Mead', options={
+            'initial_simplex': simplex_init,
+            'maxiter': self.numMes})
+        sensorless_zernike_correct = res.x
+        self.sensorless_zernike = np.zeros(self.no_actuators)
+        self.sensorless_zernike[self.nollZernike] = sensorless_zernike_correct
+        self.sensorless_ac_pos = self.proxy.set_phase(self.sensorless_zernike)
 
-        # Take image. This will trigger the iterative sensorless AO correction
-        wx.CallAfter(self.takeImage)
-
-    def correctSensorlessImage(self, image, timestamp):
-        if len(self.correction_stack) < self.zernike_applied.shape[0]:
-            print("Correction image %i/%i" % (len(self.correction_stack) + 1, self.zernike_applied.shape[0]))
-            # Store image for current applied phase
-            self.correction_stack.append(np.ndarray.tolist(image))
-            wx.CallAfter(self.correctSensorlessProcessing)
-        else:
-            print("Error in unsubscribing to camera events. Trying again")
-            events.unsubscribe("new image %s" % self.camera.name, self.correctSensorlessImage)
-
-    def correctSensorlessProcessing(self):
-        print("Processing sensorless image")
-        if len(self.correction_stack) < self.zernike_applied.shape[0]:
-            if len(self.correction_stack) % self.numMes == 0:
-                # Find aberration amplitudes and correct
-                ind = int(len(self.correction_stack) / self.numMes)
-                nollInd = np.where(self.zernike_applied[len(self.correction_stack) - 1, :] != 0)[0][0] + 1
-                print("Current Noll index being corrected: %i" % nollInd)
-                current_stack = np.asarray(self.correction_stack)[(ind - 1) * self.numMes:ind * self.numMes, :, :]
-                amp_to_correct, ac_pos_correcting = self.proxy.correct_sensorless_single_mode(image_stack=current_stack,
-                                                                                              zernike_applied=self.z_steps,
-                                                                                              nollIndex=nollInd,
-                                                                                              offset=self.actuator_offset)
-                self.actuator_offset = ac_pos_correcting
-                self.sensorless_correct_coef[nollInd - 1] += amp_to_correct
-                print("Aberrations measured: ", self.sensorless_correct_coef)
-                print("Actuator positions applied: ", self.actuator_offset)
-
-                # Advance counter by 1 and apply next phase
-                self.proxy.set_phase(self.zernike_applied[len(self.correction_stack), :], offset=self.actuator_offset)
-
-                # Take image, but ensure it's called after the phase is applied
-                wx.CallAfter(self.takeImage)
-            else:
-                # Advance counter by 1 and apply next phase
-                self.proxy.set_phase(self.zernike_applied[len(self.correction_stack), :], offset=self.actuator_offset)
-
-                # Take image, but ensure it's called after the phase is applied
-                time.sleep(0.1)
-                wx.CallAfter(self.takeImage)
-        else:
-            # Once all images have been obtained, unsubscribe
-            print("Unsubscribing to camera %s events" % self.camera.name)
-            events.unsubscribe("new image %s" % self.camera.name, self.correctSensorlessImage)
-
-            # Save full stack of images used
-            self.correction_stack = np.asarray(self.correction_stack)
-            correction_stack_file_path = os.path.join(os.path.expandvars('%LocalAppData%'),
-                                                      'cockpit',
-                                                      'sensorless_AO_correction_stack_%i%i%i_%i%i'
-                                                      % (time.gmtime()[2], time.gmtime()[1], time.gmtime()[0],
-                                                         time.gmtime()[3], time.gmtime()[4]))
-            np.save(correction_stack_file_path, self.correction_stack)
-            zernike_applied_file_path = os.path.join(os.path.expandvars('%LocalAppData%'),
-                                                     'cockpit',
-                                                     'sensorless_AO_zernike_applied_%i%i%i_%i%i'
-                                                     % (time.gmtime()[2], time.gmtime()[1], time.gmtime()[0],
-                                                        time.gmtime()[3], time.gmtime()[4]))
-            np.save(zernike_applied_file_path, self.zernike_applied)
-            nollZernike_file_path = os.path.join(os.path.expandvars('%LocalAppData%'),
+        # Save full stack of images used
+        self.correction_stack = np.asarray(self.correction_stack)
+        self.zernike_applied = np.asarray(self.zernike_applied)
+        correction_stack_file_path = os.path.join(os.path.expandvars('%LocalAppData%'),
+                                                  'cockpit',
+                                                  'sensorless_AO_correction_stack_%i%i%i_%i%i'
+                                                  % (time.gmtime()[2], time.gmtime()[1], time.gmtime()[0],
+                                                     time.gmtime()[3], time.gmtime()[4]))
+        np.save(correction_stack_file_path, self.correction_stack)
+        zernike_applied_file_path = os.path.join(os.path.expandvars('%LocalAppData%'),
                                                  'cockpit',
-                                                 'sensorless_AO_nollZernike_%i%i%i_%i%i'
+                                                 'sensorless_AO_zernike_applied_%i%i%i_%i%i'
                                                  % (time.gmtime()[2], time.gmtime()[1], time.gmtime()[0],
                                                     time.gmtime()[3], time.gmtime()[4]))
-            np.save(nollZernike_file_path, self.nollZernike)
+        np.save(zernike_applied_file_path, self.zernike_applied)
+        nollZernike_file_path = os.path.join(os.path.expandvars('%LocalAppData%'),
+                                             'cockpit',
+                                             'sensorless_AO_nollZernike_%i%i%i_%i%i'
+                                             % (time.gmtime()[2], time.gmtime()[1], time.gmtime()[0],
+                                                time.gmtime()[3], time.gmtime()[4]))
+        np.save(nollZernike_file_path, self.nollZernike)
 
-            # Find aberration amplitudes and correct
-            ind = int(len(self.correction_stack) / self.numMes)
-            nollInd = np.where(self.zernike_applied[len(self.correction_stack) - 1, :] != 0)[0][0] + 1
-            print("Current Noll index being corrected: %i" % nollInd)
-            current_stack = np.asarray(self.correction_stack)[(ind - 1) * self.numMes:ind * self.numMes, :, :]
-            amp_to_correct, ac_pos_correcting = self.proxy.correct_sensorless_single_mode(image_stack=current_stack,
-                                                                                          zernike_applied=self.z_steps,
-                                                                                          nollIndex=nollInd,
-                                                                                          offset=self.actuator_offset)
-            self.actuator_offset = ac_pos_correcting
-            self.sensorless_correct_coef[nollInd - 1] += amp_to_correct
-            print("Aberrations measured: ", self.sensorless_correct_coef)
-            print("Actuator positions applied: ", self.actuator_offset)
-            sensorless_correct_coef_file_path = os.path.join(os.path.expandvars('%LocalAppData%'),
-                                                             'cockpit',
-                                                             'sensorless_correct_coef_%i%i%i_%i%i'
-                                                             % (time.gmtime()[2], time.gmtime()[1], time.gmtime()[0],
-                                                                time.gmtime()[3], time.gmtime()[4]))
-            np.save(sensorless_correct_coef_file_path, self.sensorless_correct_coef)
-            ac_pos_sensorless_file_path = os.path.join(os.path.expandvars('%LocalAppData%'),
-                                                       'cockpit',
-                                                       'ac_pos_sensorless_%i%i%i_%i%i'
-                                                       % (time.gmtime()[2], time.gmtime()[1], time.gmtime()[0],
-                                                          time.gmtime()[3], time.gmtime()[4]))
-            np.save(ac_pos_sensorless_file_path, self.actuator_offset)
+        print("Optimisation complete")
+        # Once all images have been obtained, unsubscribe
+        print("Unsubscribing to camera %s events" % self.camera.name)
+        events.unsubscribe("new image %s" % self.camera.name, self.setAOImage)
 
-            log_file_path = os.path.join(os.path.expandvars('%LocalAppData%'),
-                                         'cockpit',
-                                         'sensorless_AO_logger.txt')
-            log_file = open(log_file_path, "a+")
-            log_file.write("Time stamp: %i:%i:%i %i/%i/%i\n" % (
+        print("Aberrations measured: ", self.sensorless_zernike)
+        print("Actuator positions applied: ", self.sensorless_ac_pos)
+        sensorless_correct_coef_file_path = os.path.join(os.path.expandvars('%LocalAppData%'),
+                                                         'cockpit',
+                                                         'sensorless_correct_coef_%i%i%i_%i%i'
+                                                         % (time.gmtime()[2], time.gmtime()[1], time.gmtime()[0],
+                                                            time.gmtime()[3], time.gmtime()[4]))
+        np.save(sensorless_correct_coef_file_path, self.sensorless_zernike)
+        ac_pos_sensorless_file_path = os.path.join(os.path.expandvars('%LocalAppData%'),
+                                                   'cockpit',
+                                                   'ac_pos_sensorless_%i%i%i_%i%i'
+                                                   % (time.gmtime()[2], time.gmtime()[1], time.gmtime()[0],
+                                                      time.gmtime()[3], time.gmtime()[4]))
+        np.save(ac_pos_sensorless_file_path, self.sensorless_ac_pos)
+
+        log_file_path = os.path.join(os.path.expandvars('%LocalAppData%'),
+                                     'cockpit',
+                                     'sensorless_AO_logger.txt')
+        log_file = open(log_file_path, "a+")
+        log_file.write("Time stamp: %i:%i:%i %i/%i/%i\n" % (
             time.gmtime()[3], time.gmtime()[4], time.gmtime()[5], time.gmtime()[2], time.gmtime()[1], time.gmtime()[0]))
-            log_file.write("Aberrations measured: ")
-            log_file.write(str(self.sensorless_correct_coef))
-            log_file.write("\n")
-            log_file.write("Actuator positions applied: ")
-            log_file.write(str(self.actuator_offset))
-            log_file.write("\n")
-            log_file.close()
+        log_file.write("Aberrations measured: ")
+        log_file.write(str(self.sensorless_zernike))
+        log_file.write("\n")
+        log_file.write("Actuator positions applied: ")
+        log_file.write(str(self.sensorless_ac_pos))
+        log_file.write("\n")
+        log_file.close()
 
-            print("Actuator positions applied: ", self.actuator_offset)
-            self.proxy.send(self.actuator_offset)
-            wx.CallAfter(self.takeImage)
+        wx.CallAfter(self.takeImage)
 
 
 # This debugging window lets each digital lineout of the DSP be manipulated
